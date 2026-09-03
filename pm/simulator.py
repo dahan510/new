@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+# 설비 스펙
+MACHINES = {
+    # machine_id : (품질등급, 마모한계 계수, 공구교체주기(분))
+    "CNC-01": {"type": "L", "osf_limit": 11000, "tool_life": 210},
+    "CNC-02": {"type": "M", "osf_limit": 12000, "tool_life": 225},
+    "CNC-03": {"type": "H", "osf_limit": 13000, "tool_life": 240},
+}
+
+# 관측 오염 강도 (기본값 = "현장급")
+POLLUTION = {
+    "dropout_rate": 0.015,  # 통신 끊김으로 통째로 사라지는 구간 발생 확률
+    "dropout_len": (3, 40),  # 끊김 길이(분)
+    "nan_rate": 0.008,  # 개별 센서값만 NaN
+    "spike_rate": 0.004,  # 센서 튐(전기 노이즈)
+    "dup_rate": 0.006,  # 같은 레코드 중복 전송
+    "ts_jitter_rate": 0.05,  # 타임스탬프 흔들림
+    "unit_mix_rate": 0.10,  # 단위 혼재(K 대신 섭씨로 오는 구간)
+    "drift_per_day": 0.35,  # 온도 센서 드리프트 (K/day)
+}
+
+
+# 물리 기반 참값 생성
+def _simulate_one(
+    machine_id: str, n_minutes: int, start: pd.Timestamp, rng: np.random.Generator
+) -> pd.DataFrame:
+    spec = MACHINES[machine_id]
+    ts = pd.date_range(start, periods=n_minutes, freq="min")
+
+    # --- 공정 부하: 근무 시간대에 높고 야간에 낮음 (일주기) ---
+    hour = ts.hour + ts.minute / 60.0
+    duty = 0.55 + 0.45 * np.sin((hour - 6) / 24 * 2 * np.pi)  # 0.1 ~ 1.0
+    duty = np.clip(duty + rng.normal(0, 0.05, n_minutes), 0.05, 1.0)
+
+    # --- 공기 온도: 계절/일교차 + 랜덤워크 ---
+    air = 298.0 + 2.0 * np.sin((hour - 14) / 24 * 2 * np.pi)
+    air = air + np.cumsum(rng.normal(0, 0.02, n_minutes))  # 완만한 표류
+    air = air + rng.normal(0, 0.15, n_minutes)
+
+    # --- 공구 마모: 누적되다가 교체하면 0으로 ---
+    tool_life = spec["tool_life"]
+    wear_rate = 1.0 + 0.6 * duty  # 부하 클수록 빨리 닳음
+    wear = np.zeros(n_minutes)
+    acc = rng.uniform(0, 60)  # 시작 시점 마모도는 랜덤
+    limit = tool_life * rng.uniform(0.90, 1.15)
+    for i in range(n_minutes):
+        acc += wear_rate[i]
+        if acc > limit:  # 계획 교체 (정비반 재량으로 조금씩 다름)
+            acc = 0.0
+            limit = tool_life * rng.uniform(0.90, 1.15)
+        wear[i] = acc
+
+    # --- 회전수: 부하에 반비례(무거운 절삭일수록 저속) ---
+    rpm = 2860 - 1500 * duty + rng.normal(0, 45, n_minutes)
+    rpm = np.clip(rpm, 1150, 2900)
+
+    # --- 토크: 부하에 비례, 마모되면 저항 증가 ---
+    torque = 10 + 40 * duty + 0.02 * wear + rng.normal(0, 2.0, n_minutes)
+    torque = np.clip(torque, 3.0, 80.0)
+
+    # --- 냉각(HVAC) 이상: 가끔 공장 공조가 죽어 실내가 더워짐 ---
+    hvac_fail = np.zeros(n_minutes, dtype=bool)
+    for _ in range(max(1, n_minutes // 2000)):
+        s = rng.integers(0, max(1, n_minutes - 120))
+        hvac_fail[s : s + rng.integers(40, 120)] = True
+    air = air + 5.5 * hvac_fail  # 실내 온도 상승
+
+    # --- 공정 온도: 공기온도 + 절삭열. 쿨런트가 process 쪽은 어느 정도 잡아줌 ---
+    power_w = torque * rpm * 2 * np.pi / 60.0  # [W]
+    proc = air + 8.5 + power_w / 1400.0 + 0.004 * wear
+    proc = proc - 6.0 * hvac_fail  # 온도차(방열 여력)가 줄어듦
+    proc = proc + rng.normal(0, 0.12, n_minutes)
+
+    # --- 진동: 마모·회전수에 비례. 마모 후반에 급격히 커짐 ---
+    vib = (
+        0.8
+        + 0.0009 * rpm
+        + 0.9 * (wear / tool_life) ** 3
+        + rng.normal(0, 0.06, n_minutes)
+    )
+    vib = np.clip(vib, 0.1, None)
+
+    # --- 전류: 전력/전압(380V, 역률 0.85, 3상) ---
+    current = power_w / (380 * 1.732 * 0.85) + rng.normal(0, 0.15, n_minutes)
+    current = np.clip(current, 0.2, None)
+
+    # --- 습도: 온도와 약한 음의 관계 ---
+    humid = 55 - 1.8 * (air - 298) + rng.normal(0, 2.5, n_minutes)
+    humid = np.clip(humid, 15, 95)
+
+    df = pd.DataFrame(
+        {
+            "ts": ts,
+            "machine_id": machine_id,
+            "type": spec["type"],
+            "air_temp_k": air,
+            "process_temp_k": proc,
+            "rot_speed_rpm": rpm,
+            "torque_nm": torque,
+            "tool_wear_min": wear,
+            "vibration_mms": vib,
+            "current_a": current,
+            "humidity_pct": humid,
+        }
+    )
+
+    # 고장 라벨 (AI4I 2020 정의)
+    twf = (wear >= 200) & (wear <= 240) & (rng.random(n_minutes) < 0.004)
+    hdf = ((proc - air) < 8.6) & (rpm < 1380)
+    pwf = (power_w < 3500) | (power_w > 9000)
+    osf = (wear * torque) > spec["osf_limit"]
+    rnf = rng.random(n_minutes) < 0.0002  # 원인 불명 랜덤 고장
+
+    df["twf"] = twf.astype(int)
+    df["hdf"] = hdf.astype(int)
+    df["pwf"] = pwf.astype(int)
+    df["osf"] = osf.astype(int)
+    df["rnf"] = rnf.astype(int)
+    df["machine_failure"] = (twf | hdf | pwf | osf | rnf).astype(int)
+    df["power_w"] = power_w
+    return df
+
+
+def simulate_truth(
+    n_minutes: int = 1440, start: str | pd.Timestamp = "2024-01-01", seed: int = 42
+) -> pd.DataFrame:
+    """오염 없는 참값을 생성합니다."""
+    rng = np.random.default_rng(seed)
+    start = pd.Timestamp(start)
+    parts = [_simulate_one(m, n_minutes, start, rng) for m in MACHINES]
+    out = pd.concat(parts, ignore_index=True)
+    return out.sort_values(["ts", "machine_id"]).reset_index(drop=True)
