@@ -69,3 +69,13 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def sample_window(n_minutes=60, end=None, seed=None):
+    end = pd.Timestamp.utcnow().floor("min") if end is None else pd.Timestamp(end)
+    start = end - pd.Timedelta(minutes=n_minutes)
+    if seed is None:
+        seed = int(start.strftime("%Y%m%d%H"))
+    truth = simulate_truth(n_minutes=n_minutes, start=start, seed=seed)
+    obs = pollute(truth, seed=seed + 1)
+    return obs
