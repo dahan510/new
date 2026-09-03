@@ -15,6 +15,22 @@ ROOT = Path(__file__).resolve().parents[1]
 HIST = ROOT / "data" / "history"
 
 
+def upsert(con, df):
+    df = df.reindex(columns=COLUMNS)
+    before = con.execute("SELECT COUNT(*) FROM sensor_raw").fetchone()[0]
+    sql = (
+        f"INSERT OR IGNORE INTO sensor_raw ({','.join(COLUMNS)})"
+        f"VALUES ({','.join('?' * len(COLUMNS))})"
+    )
+    con.executemany(
+        sql, df.where(pd.notna(df), None).itertuples(index=False, name=None)
+    )
+    con.commit()
+    after = con.execute("SELECT COUNT(*) FROM sensor_raw").fetchone()[0]
+    inserted = after - before
+    return inserted, len(df) - inserted
+
+
 # 센서 데이터 받아오기
 def fetch(minutes: int, end: str | None = None) -> pd.DataFrame:
     return sample_window(n_minutes=minutes, end=end)
