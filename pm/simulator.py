@@ -134,3 +134,156 @@ def simulate_truth(
     parts = [_simulate_one(m, n_minutes, start, rng) for m in MACHINES]
     out = pd.concat(parts, ignore_index=True)
     return out.sort_values(["ts", "machine_id"]).reset_index(drop=True)
+
+
+truth = simulate_truth(n_minutes=1440 * 14, start="2024-01-01", seed=42)
+print("설비 수 :", truth["machine_id"].nunique())
+print("기간    :", truth["ts"].min(), "~", truth["ts"].max())
+print("행 수   :", f"{len(truth):,}")
+
+# 오염 주입
+SENSOR_COLS = [
+    "air_temp_k",
+    "process_temp_k",
+    "rot_speed_rpm",
+    "torque_nm",
+    "tool_wear_min",
+    "vibration_mms",
+    "current_a",
+    "humidity_pct",
+]
+
+print(truth[SENSOR_COLS].describe().loc[["mean", "std", "min", "50%", "max"]].round(2))
+
+
+# 6가지 오염
+def pollute(
+    truth: pd.DataFrame,  # 정상적인 센서 데이터
+    seed: int = 7,  # 랜덤 데이터를 만들 때 사용할 기준값
+    cfg: dict | None = None,  # 오염 설정값을 추가로 받을 수 있음
+    return_masks: bool = False,  # 오염된 위치를 표시한 mask도 반환할지 결정
+):
+    c = dict(POLLUTION)  # 기본 오염 설정을 복사해서 c에 저장
+    if cfg:
+        c.update(cfg)
+    rng = np.random.default_rng(seed)
+    df = truth.copy()
+    masks = pd.DataFrame(index=df.index)
+
+    # 관측 데이터에는 참값 라벨 중 machine_failure만 남깁니다.
+    # 즉, 실제 센서가 관측할 수 없는 '정답 정보'를 없애는 것
+    df = df.drop(columns=["twf", "hdf", "pwf", "osf", "rnf", "power_w"])
+
+    # 전체 데이터에서 가장 이른 시간(첫 번째 시간)을 기준점으로 설정
+    t0 = df["ts"].min()
+    days = (df["ts"] - t0).dt.total_seconds() / 86400.0
+
+    # --- (a) 센서 드리프트: CNC-02 온도 센서만 서서히 밀림 ---
+    m2 = df["machine_id"] == "CNC-02"
+    df.loc[m2, "process_temp_k"] += c["drift_per_day"] * days[m2]
+
+    # --- (b) 단위 혼재: 특정 구간에서 온도가 섭씨로 들어옴 ---
+    n = len(df)
+    unit_block = np.zeros(n, dtype=bool)
+    n_blocks = max(1, int(n * c["unit_mix_rate"] / 200))
+    for _ in range(n_blocks):
+        s = rng.integers(0, n - 200)
+        unit_block[s : s + 200] = True
+    df.loc[unit_block, "air_temp_k"] -= 273.15
+    df.loc[unit_block, "process_temp_k"] -= 273.15
+    masks["unit_temp"] = unit_block
+    # 진동 단위도 일부는 m/s^2 로 (×9.81)
+    vib_block = rng.random(n) < 0.04
+    df.loc[vib_block, "vibration_mms"] *= 9.81
+    masks["unit_vib"] = vib_block
+
+    # --- (c) 센서 튐: 값이 순간적으로 10~50배 또는 0 ---
+    for col in SENSOR_COLS:
+        hit = rng.random(n) < c["spike_rate"]
+        mode = rng.random(n)
+        df.loc[hit & (mode < 0.5), col] = df.loc[hit & (mode < 0.5), col] * rng.uniform(
+            8, 40
+        )
+        df.loc[hit & (mode >= 0.5), col] = 0.0
+        masks[f"spike_{col}"] = hit
+
+    # --- (d) 개별 결측 ---
+    for col in SENSOR_COLS:
+        hit = rng.random(n) < c["nan_rate"]
+        df.loc[hit, col] = np.nan
+        masks[f"nan_{col}"] = hit
+
+    # --- (e) 통신 끊김: 행 자체가 사라짐 ---
+    drop_mask = np.zeros(n, dtype=bool)
+    n_drop = int(n * c["dropout_rate"] / 10)
+    for _ in range(max(1, n_drop)):
+        s = rng.integers(0, n)
+        ln = rng.integers(*c["dropout_len"]) * 3  # 설비 3대 × 분
+        drop_mask[s : s + ln] = True
+    masks["dropped"] = drop_mask
+    keep = ~drop_mask
+    df = df[keep].copy()
+    kept_masks = masks[keep].copy()
+
+    # --- (f) 중복 전송 ---
+    n2 = len(df)
+    dup_idx = rng.random(n2) < c["dup_rate"]
+    dups = df[dup_idx].copy()
+    kept_masks["is_dup"] = False
+    dup_masks = kept_masks[dup_idx].copy()
+    dup_masks["is_dup"] = True
+    df = pd.concat([df, dups], ignore_index=True)
+    kept_masks = pd.concat([kept_masks, dup_masks], ignore_index=True)
+
+    # --- (g) 타임스탬프 흔들림 + 순서 뒤섞임 ---
+    n3 = len(df)
+    jitter = np.where(
+        rng.random(n3) < c["ts_jitter_rate"], rng.integers(-90, 90, n3), 0
+    )
+    df["ts"] = df["ts"] + pd.to_timedelta(jitter, unit="s")
+    kept_masks["ts_jittered"] = jitter != 0
+    order = rng.permutation(n3)
+    df = df.iloc[order].reset_index(drop=True)
+    kept_masks = kept_masks.iloc[order].reset_index(drop=True)
+
+    # --- (h) 실제 수집기가 붙이는 메타 컬럼 ---
+    df["collected_at"] = pd.Timestamp("2024-01-01")
+    df["ts"] = df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")  # 문자열로 들어옴(현실)
+    if return_masks:
+        return df, kept_masks
+    return df
+
+
+obs, masks = pollute(truth, seed=7, return_masks=True)
+print("참값 행수 :", f"{len(truth):,}")
+print("관측 행수 :", f"{len(obs):,}", f"({len(obs) - len(truth):+,})")
+# print(obs.head(3).to_string())
+print(obs["air_temp_k"].describe().round(2).to_string())
+print("200 K 미만 비율: %.2f%%" % ((obs["air_temp_k"] < 200).mean() * 100))
+inj = pd.DataFrame({"건수": masks.sum(), "비율(%)": (masks.mean() * 100).round(3)})
+print(inj.to_string())
+
+
+# 실시간 수집용
+def sample_window(
+    n_minutes: int = 60,  # 몇 분 동안의 데이터를 가져올지
+    end: pd.Timestamp | None = None,  # 데이터의 마지막 시간
+    seed: int | None = None,  # 랜덤값을 만들 때 사용할 기준값
+) -> pd.DataFrame:
+    end = pd.Timestamp.utcnow().floor("min") if end is None else pd.Timestamp(end)
+    start = end - pd.Timedelta(minutes=n_minutes)
+    # 시드를 날짜에서 뽑으면 같은 날 다시 돌려도 같은 값이 나옵니다(재현성)
+    if seed is None:
+        seed = int(start.strftime("%Y%m%d%H"))
+    truth = simulate_truth(n_minutes=n_minutes, start=start, seed=seed)
+    obs = pollute(truth, seed=seed + 1)
+    obs["collected_at"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return obs
+
+
+if __name__ == "__main__":
+    t = simulate_truth(n_minutes=1440, start="2024-01-01", seed=42)
+    o = pollute(t, seed=7)
+    print("truth   :", t.shape)
+    print("observed:", o.shape)
+    print(o.head(3).to_string())
