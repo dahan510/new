@@ -99,9 +99,20 @@ def detect_vibration_unit(
     return df, int(mask.sum())
 
 
+def range_check(df, rng=None):
+    """범위 밖 값을 NaN으로 바꿉니다."""
+    rng = rng or PHYS_RANGE
+    df = df.copy()
+    report = {}
+    for c, (lo, hi) in rng.items():
+        bad = df[c].notna() & ~df[c].between(lo, hi)
+        report[c] = int(bad.sum())
+        df.loc[bad, c] = np.nan
+    return df, report
+
+
 # 스파이크 탐지
 def hampel_flag(s: pd.Series, window: int = 11, n_sigma: float = 5.0) -> pd.Series:
-
     med = s.rolling(window, center=True, min_periods=3).median()
     mad = (s - med).abs().rolling(window, center=True, min_periods=3).median()
     sigma = 1.4826 * mad
@@ -126,12 +137,7 @@ def flag_spikes(df: pd.DataFrame, cols=None, window=11, n_sigma=5.0):
 
 # 결측 보간
 def interpolate_short_gaps(df: pd.DataFrame, cols=None, max_gap: int = 5):
-    """max_gap분 이하의 짧은 구간만 시간 보간합니다.
-
-    ★ 긴 끊김을 보간하면 '없던 데이터를 만들어내는' 것이 됩니다.
-    30분 통신 두절 구간을 직선으로 채우면 모델은 그 30분을 '아주 안정적인 구간'으로
-    배웁니다. 실제로는 아무 정보가 없는데도 말입니다.
-    """
+    """max_gap분 이하의 짧은 구간만 시간 보간합니다."""
     cols = cols or SENSOR_COLS
     df = df.sort_values(["machine_id", "ts"]).copy()
     filled = {}
@@ -195,3 +201,61 @@ def correct_drift(
         df.loc[mask, col] = df.loc[mask, col] - s * days[mask]
         applied[m] = s
     return df, applied
+
+
+# 시간축 재색인
+def reindex_time(df: pd.DataFrame, freq: str = "min") -> pd.DataFrame:
+    """빠진 분을 NaN 행으로 명시합니다. 'is_gap' 컬럼으로 표시합니다."""
+    parts = []
+    for m, g in df.groupby("machine_id"):
+        g = g.set_index("ts").sort_index()
+        full = pd.date_range(g.index.min(), g.index.max(), freq=freq)
+        g2 = g.reindex(full)
+        g2["is_gap"] = g2["machine_id"].isna()
+        g2["machine_id"] = m
+        g2["type"] = g["type"].iloc[0] if "type" in g.columns else None
+        g2.index.name = "ts"
+        parts.append(g2.reset_index())
+    return pd.concat(parts, ignore_index=True).sort_values(["ts", "machine_id"])
+
+
+# 전체 파이프라인
+def run_pipeline(raw: pd.DataFrame, verbose: bool = True):
+    log = StepLog()
+    rep = {}
+
+    df = log("0. 원본 수신", raw.copy())
+    df = log("1. 타입 강제", coerce_types(df))
+    df = log("2. 타임스탬프 스냅", snap_timestamp(df))
+    df = log("3. 중복 제거", drop_dups(df))
+
+    df, rep["temp_unit"] = detect_and_fix_temp_unit(df)
+    df = log("4a. 온도 단위 통일", df)
+    df, rep["vib_unit"] = detect_vibration_unit(df)
+    df = log("4b. 진동 단위 통일", df)
+
+    df, rep["range"] = range_check(df)
+    df = log("5. 물리범위 → NaN", df)
+
+    df = flag_spikes(df)
+    df = log("6. 스파이크 플래그", df)
+
+    df, rep["filled"] = interpolate_short_gaps(df)
+    df = log("7. 짧은 결측 보간", df)
+
+    slopes, rep["drift_daily"] = estimate_drift(df)
+    rep["drift_slopes"] = slopes
+    df, rep["drift_applied"] = correct_drift(df, slopes)
+    df = log("8. 드리프트 보정", df)
+
+    df = reindex_time(df)
+    df = log("9. 시간축 재색인", df)
+
+    if verbose:
+        print(log.frame().to_string(index=False))
+    return df, log, rep
+
+
+from clean import run_pipeline
+
+clean, log, rep = run_pipeline(obs)
