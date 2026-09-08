@@ -1,3 +1,22 @@
+"""
+정제 파이프라인
+===============
+"오염 주입"의 역순으로 벗겨냅니다. 순서가 중요합니다.
+
+  1) 타입 강제        문자열로 온 숫자·시각을 제자리로
+  2) 중복 제거        (machine_id, ts) 기준
+  3) 타임스탬프 정렬  초 단위 흔들림을 분에 스냅
+  4) 단위 통일        섭씨↔켈빈, m/s²↔mm/s
+  5) 물리 범위 검사   불가능한 값을 NaN으로 (지우지 않음)
+  6) 스파이크 탐지    Hampel 필터 — ★ 지우지 말고 플래그만
+  7) 결측 보간        짧은 구간만. 긴 끊김은 그대로 남긴다
+  8) 드리프트 보정    다른 설비를 기준으로 밀린 양을 추정
+  9) 시간축 재색인    빠진 분을 명시적으로 드러낸다
+
+★ 모든 단계는 StepLog에 행 수를 남깁니다.
+  "원본 대비 최종 건수 차이를 설명할 수 있나?"에 답하기 위해서입니다.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -27,8 +46,9 @@ PHYS_RANGE = {
 }
 
 
-# 정제 파이프라인을 거치면서 데이터가 몇 개씩 줄어드는지 기록
 class StepLog:
+    """단계마다 행 수를 기록합니다. (3권 부록 C의 그 패턴)"""
+
     def __init__(self):
         self.rows = []
 
@@ -41,12 +61,12 @@ class StepLog:
         return pd.DataFrame(self.rows, columns=["단계", "행수", "증감"])
 
 
-# 정제
+# ----------------------------------------------------------------------
+# 1~3. 타입 · 중복 · 타임스탬프
+# ----------------------------------------------------------------------
 def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ts"] = pd.to_datetime(
-        df["ts"], errors="coerce"
-    )  # "ts" 컬럼을 날짜/시간 형식으로 변환
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
     for c in SENSOR_COLS + ["machine_failure"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -70,13 +90,15 @@ def drop_dups(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-# 단위 통일
+# ----------------------------------------------------------------------
+# 4. 단위 통일
+# ----------------------------------------------------------------------
 def detect_and_fix_temp_unit(df: pd.DataFrame, cols=("air_temp_k", "process_temp_k")):
     """켈빈이어야 하는 컬럼에 섭씨가 섞였는지 판정합니다.
 
     판정 근거는 '물리적 불가능'입니다.
     공장 실내 온도가 200 K(-73도)일 수는 없습니다. 그러니 200 미만은 섭씨입니다.
-    임계값을 데이터가 아니라 도메인에서 가져오는 게 핵심입니다.
+    ★ 임계값을 데이터가 아니라 도메인에서 가져오는 게 핵심입니다.
     """
     df = df.copy()
     report = {}
@@ -92,6 +114,13 @@ def detect_and_fix_temp_unit(df: pd.DataFrame, cols=("air_temp_k", "process_temp
 def detect_vibration_unit(
     df: pd.DataFrame, col="vibration_mms", factor=9.81, ratio=4.0
 ):
+    """진동값에 m/s²가 섞였는지 추정합니다.
+
+    ★ 주의: 이건 온도만큼 확실하지 않습니다.
+    27 mm/s는 물리적으로 불가능한 값이 아닙니다(고장난 설비면 나올 수 있음).
+    그래서 '설비별 중앙값의 ratio배 이상'이라는 통계적 기준을 씁니다.
+    메타데이터(태그 단위표)가 있으면 그걸 쓰는 게 항상 낫습니다.
+    """
     df = df.copy()
     med = df.groupby("machine_id")[col].transform("median")
     mask = df[col].notna() & (df[col] > med * ratio)
@@ -99,20 +128,35 @@ def detect_vibration_unit(
     return df, int(mask.sum())
 
 
-def range_check(df, rng=None):
-    """범위 밖 값을 NaN으로 바꿉니다."""
+# ----------------------------------------------------------------------
+# 5. 물리 범위 검사
+# ----------------------------------------------------------------------
+def range_check(df: pd.DataFrame, rng: dict | None = None):
+    """범위 밖 값을 NaN으로 바꿉니다. ★ 행을 지우지 않습니다.
+
+    행을 지우면 그 시각의 다른 정상 센서값까지 함께 잃습니다.
+    """
     rng = rng or PHYS_RANGE
     df = df.copy()
     report = {}
     for c, (lo, hi) in rng.items():
+        if c not in df.columns:
+            continue
         bad = df[c].notna() & ~df[c].between(lo, hi)
         report[c] = int(bad.sum())
         df.loc[bad, c] = np.nan
     return df, report
 
 
-# 스파이크 탐지
+# ----------------------------------------------------------------------
+# 6. 스파이크 탐지 (Hampel)
+# ----------------------------------------------------------------------
 def hampel_flag(s: pd.Series, window: int = 11, n_sigma: float = 5.0) -> pd.Series:
+    """이동 중앙값에서 n_sigma * MAD 이상 떨어진 점을 True로 표시합니다.
+
+    표준편차가 아니라 MAD를 쓰는 이유: 스파이크 자체가 표준편차를 부풀려서
+    정작 그 스파이크를 못 잡습니다(이상치가 자기 기준을 망침).
+    """
     med = s.rolling(window, center=True, min_periods=3).median()
     mad = (s - med).abs().rolling(window, center=True, min_periods=3).median()
     sigma = 1.4826 * mad
@@ -121,6 +165,11 @@ def hampel_flag(s: pd.Series, window: int = 11, n_sigma: float = 5.0) -> pd.Seri
 
 
 def flag_spikes(df: pd.DataFrame, cols=None, window=11, n_sigma=5.0):
+    """★★ 플래그만 답니다. 지우지 않습니다.
+
+    설비 이상은 '값이 튀는 것'으로 나타납니다.
+    스파이크를 무조건 지우면 고장 신호를 지우게 됩니다. (5장에서 실측으로 보여드립니다)
+    """
     cols = cols or SENSOR_COLS
     df = df.copy()
     for c in cols:
@@ -135,9 +184,16 @@ def flag_spikes(df: pd.DataFrame, cols=None, window=11, n_sigma=5.0):
     return df
 
 
-# 결측 보간
+# ----------------------------------------------------------------------
+# 7. 결측 보간
+# ----------------------------------------------------------------------
 def interpolate_short_gaps(df: pd.DataFrame, cols=None, max_gap: int = 5):
-    """max_gap분 이하의 짧은 구간만 시간 보간합니다."""
+    """max_gap분 이하의 짧은 구간만 시간 보간합니다.
+
+    ★ 긴 끊김을 보간하면 '없던 데이터를 만들어내는' 것이 됩니다.
+    30분 통신 두절 구간을 직선으로 채우면 모델은 그 30분을 '아주 안정적인 구간'으로
+    배웁니다. 실제로는 아무 정보가 없는데도 말입니다.
+    """
     cols = cols or SENSOR_COLS
     df = df.sort_values(["machine_id", "ts"]).copy()
     filled = {}
@@ -154,7 +210,9 @@ def interpolate_short_gaps(df: pd.DataFrame, cols=None, max_gap: int = 5):
     return df, filled
 
 
-# 드리프트 보정
+# ----------------------------------------------------------------------
+# 8. 드리프트 보정
+# ----------------------------------------------------------------------
 def estimate_drift(df: pd.DataFrame, col="process_temp_k", ref="air_temp_k"):
     """설비별로 (col - ref)의 일별 중앙값이 시간에 따라 밀리는지 봅니다.
 
@@ -203,7 +261,9 @@ def correct_drift(
     return df, applied
 
 
-# 시간축 재색인
+# ----------------------------------------------------------------------
+# 9. 시간축 재색인
+# ----------------------------------------------------------------------
 def reindex_time(df: pd.DataFrame, freq: str = "min") -> pd.DataFrame:
     """빠진 분을 NaN 행으로 명시합니다. 'is_gap' 컬럼으로 표시합니다."""
     parts = []
@@ -219,7 +279,9 @@ def reindex_time(df: pd.DataFrame, freq: str = "min") -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True).sort_values(["ts", "machine_id"])
 
 
+# ----------------------------------------------------------------------
 # 전체 파이프라인
+# ----------------------------------------------------------------------
 def run_pipeline(raw: pd.DataFrame, verbose: bool = True):
     log = StepLog()
     rep = {}
@@ -254,8 +316,3 @@ def run_pipeline(raw: pd.DataFrame, verbose: bool = True):
     if verbose:
         print(log.frame().to_string(index=False))
     return df, log, rep
-
-
-from clean import run_pipeline
-
-clean, log, rep = run_pipeline(obs)

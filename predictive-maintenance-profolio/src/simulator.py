@@ -141,6 +141,9 @@ print("설비 수 :", truth["machine_id"].nunique())
 print("기간    :", truth["ts"].min(), "~", truth["ts"].max())
 print("행 수   :", f"{len(truth):,}")
 
+modes = truth[["twf", "hdf", "pwf", "osf", "rnf", "machine_failure"]].sum()
+print(pd.DataFrame({"건수": modes, "비율(%)": (modes / len(truth) * 100).round(3)}))
+
 # 오염 주입
 SENSOR_COLS = [
     "air_temp_k",
@@ -254,10 +257,23 @@ def pollute(
     return df
 
 
+sens = [
+    "air_temp_k",
+    "process_temp_k",
+    "rot_speed_rpm",
+    "torque_nm",
+    "tool_wear_min",
+    "vibration_mms",
+    "current_a",
+    "humidity_pct",
+]
+
 obs, masks = pollute(truth, seed=7, return_masks=True)
 print("참값 행수 :", f"{len(truth):,}")
 print("관측 행수 :", f"{len(obs):,}", f"({len(obs) - len(truth):+,})")
-# print(obs.head(3).to_string())
+# 오염된 데이터 확인
+print(obs.head(3).to_string())
+print((obs[sens].isna().mean() * 100).round(2).to_string())
 print(obs["air_temp_k"].describe().round(2).to_string())
 print("200 K 미만 비율: %.2f%%" % ((obs["air_temp_k"] < 200).mean() * 100))
 inj = pd.DataFrame({"건수": masks.sum(), "비율(%)": (masks.mean() * 100).round(3)})

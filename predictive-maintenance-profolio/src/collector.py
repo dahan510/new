@@ -15,24 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 HIST = ROOT / "data" / "history"
 
 
-def upsert(con, df):
-    df = df.reindex(columns=COLUMNS)
-    before = con.execute("SELECT COUNT(*) FROM sensor_raw").fetchone()[0]
-    sql = (
-        f"INSERT OR IGNORE INTO sensor_raw ({','.join(COLUMNS)})"
-        f"VALUES ({','.join('?' * len(COLUMNS))})"
-    )
-    con.executemany(
-        sql, df.where(pd.notna(df), None).itertuples(index=False, name=None)
-    )
-    con.commit()
-    after = con.execute("SELECT COUNT(*) FROM sensor_raw").fetchone()[0]
-    inserted = after - before
-    return inserted, len(df) - inserted
-
-
-# 센서 데이터 받아오기
 def fetch(minutes: int, end: str | None = None) -> pd.DataFrame:
+    """센서 소스 호출부. 실제 현장이라면 여기가 REST API 호출이 됩니다.
+
+    예)  r = requests.get(API, params={...}, timeout=10)
+         r.raise_for_status()
+         return pd.DataFrame(r.json()["items"])
+    """
     return sample_window(n_minutes=minutes, end=end)
 
 
@@ -85,13 +74,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-def sample_window(n_minutes=60, end=None, seed=None):
-    end = pd.Timestamp.utcnow().floor("min") if end is None else pd.Timestamp(end)
-    start = end - pd.Timedelta(minutes=n_minutes)
-    if seed is None:
-        seed = int(start.strftime("%Y%m%d%H"))
-    truth = simulate_truth(n_minutes=n_minutes, start=start, seed=seed)
-    obs = pollute(truth, seed=seed + 1)
-    return obs
